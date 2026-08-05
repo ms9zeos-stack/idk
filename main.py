@@ -3020,17 +3020,23 @@ def _target_chat_id(user_id: int | None = None) -> int | None:
 
 
 async def _replace_message(query, text: str, reply_markup=None, parse_mode: str | None = "Markdown"):
-    """Delivers an audit-style message as a fresh message (immutability policy)."""
+    """Update the current panel message without creating duplicate outputs."""
     try:
-        await query.message.delete()
+        await query.edit_message_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
     except TelegramError:
-        pass
-    await query.message.get_bot().send_message(
-        chat_id=query.message.chat_id,
-        text=text,
-        parse_mode=parse_mode,
-        reply_markup=reply_markup,
-    )
+        # Some old Telegram messages cannot be edited. Only in that case do
+        # we create a replacement message; normal panel navigation never
+        # deletes and re-sends the same output.
+        await query.message.get_bot().send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
 
 
 def _wrap_rows(rows) -> InlineKeyboardMarkup:
@@ -3155,7 +3161,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Managed-chats: chat selector (owner only, before chat_id is resolved) ----
     if data.startswith("chats:select:"):
         if not db.is_owner(user.id):
-            await query.answer("Owner only.", show_alert=True)
+            await query.message.reply_text("Owner only.")
             return
         selected_id = int(data.split(":", 2)[2])
         _PANEL_CONTEXT[user.id] = selected_id
@@ -3171,11 +3177,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- panel:select_chat — re-open the chat picker ----
     if data == "panel:select_chat":
         if not db.is_owner(user.id):
-            await query.answer("Owner only.", show_alert=True)
+            await query.message.reply_text("Owner only.")
             return
         managed = db.list_managed_chats()
         if len(managed) <= 1:
-            await query.answer("Only one managed chat — no need to switch.", show_alert=True)
+            await query.message.reply_text("Only one managed chat — no need to switch.")
             return
         await query.edit_message_text(
             "*Select a chat to configure:*",
@@ -3190,14 +3196,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Allowed-chats panel (owner only, no chat context required) ----
     if data in {"panel:chats", "panel:allowed_chats"}:
         if not db.is_owner(user.id):
-            await query.answer("Owner only.", show_alert=True)
+            await query.message.reply_text("Owner only.")
             return
         await _show_managed_chats(query)
         return
 
     if data == "chats:add":
         if not db.is_owner(user.id):
-            await query.answer("Owner only.", show_alert=True)
+            await query.message.reply_text("Owner only.")
             return
         # Use a special pending-input key that does not depend on chat_id
         _PENDING_INPUT[(-1, user.id)] = "add_chat"
@@ -3212,7 +3218,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("chats:remove:"):
         if not db.is_owner(user.id):
-            await query.answer("Owner only.", show_alert=True)
+            await query.message.reply_text("Owner only.")
             return
         remove_id = int(data.split(":", 2)[2])
         chat_info = db.get_managed_chat(remove_id)
@@ -3221,11 +3227,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _PANEL_CONTEXT.get(user.id) == remove_id:
             _PANEL_CONTEXT.pop(user.id, None)
         title = (chat_info.get("title") if chat_info else None) or str(remove_id)
-        if removed:
-            await query.answer(f"Removed: {title}", show_alert=False)
+        # The callback was already acknowledged once at the top of this
+        # function. Put the status in the edited panel instead of trying to
+        # acknowledge the same callback a second time.
         await query.edit_message_text(
-            "*📋 Managed Chats*\n\n"
-            "Tap a chat to remove it, or add a new one:",
+            f"*Allowed channels and groups*\n\n"
+            f"{'Removed: ' + title if removed else 'That chat was not in the list.'}\n\n"
+            "Select a chat to remove it, or add a new one:",
             parse_mode="Markdown",
             reply_markup=managed_chats_menu(),
         )
@@ -3233,9 +3241,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # All remaining callbacks require a resolved chat_id
     if chat_id is None or not is_group_admin_or_owner(chat_id, user.id):
-        await query.answer(
-            "No chat selected or access denied. Use /panel to pick a chat first.",
-            show_alert=True,
+        await query.message.reply_text(
+            "No chat selected or access denied. Use /panel to pick a chat first."
         )
         return
 
