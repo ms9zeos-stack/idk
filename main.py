@@ -2122,18 +2122,18 @@ def confirm_close() -> InlineKeyboardMarkup:
 
 
 def managed_chats_menu() -> InlineKeyboardMarkup:
-    """Lists all managed chats with a remove button, plus an Add option."""
+    """Lists the allowed chats with remove and add controls."""
     chats = db.list_managed_chats()
     rows = []
     for chat in chats:
         title = chat.get("title") or str(chat["chat_id"])
         rows.append([
             InlineKeyboardButton(
-                f"🗑 {title} ({chat['chat_id']})",
+                f"Remove {title} ({chat['chat_id']})",
                 callback_data=f"chats:remove:{chat['chat_id']}",
             )
         ])
-    rows.append([InlineKeyboardButton("➕ Add channel / group", callback_data="chats:add")])
+    rows.append([InlineKeyboardButton("Add allowed channel / group", callback_data="chats:add")])
     rows.append(back_close_row())
     return InlineKeyboardMarkup(rows)
 
@@ -2152,6 +2152,30 @@ def chat_selector_menu() -> InlineKeyboardMarkup:
         ])
     rows.append([InlineKeyboardButton("Close", callback_data="panel:close")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_managed_chats(query) -> None:
+    """Render the allowed-chats screen, with a fallback for non-editable messages."""
+    text = (
+        "*Allowed channels and groups*\n\n"
+        "The bot protects every chat listed below. Select a chat to remove it, "
+        "or add a new channel/group using its numeric ID.\n\n"
+        "The bot must already be an administrator in a chat before it can protect it."
+    )
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=managed_chats_menu(),
+        )
+    except TelegramError:
+        # A callback can originate from an old or non-editable message. The
+        # control must still open instead of silently failing.
+        await query.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=managed_chats_menu(),
+        )
 
 
 # =============================================================================
@@ -3163,20 +3187,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve the target chat for the rest of the callbacks
     chat_id = _target_chat_id(user.id)
 
-    # ---- Managed-chats panel (owner only, no chat context required) ----
-    if data == "panel:chats":
+    # ---- Allowed-chats panel (owner only, no chat context required) ----
+    if data in {"panel:chats", "panel:allowed_chats"}:
         if not db.is_owner(user.id):
             await query.answer("Owner only.", show_alert=True)
             return
-        await query.edit_message_text(
-            "*📋 Managed Chats*\n\n"
-            "The bot protects all chats listed below. Tap a chat to remove it.\n"
-            "To add a new channel or group, tap *Add* and send its numeric ID.\n\n"
-            "_How to get a chat ID:_ forward any message from the chat to @userinfobot, "
-            "or add @username\\_to\\_id\\_bot to the group temporarily._",
-            parse_mode="Markdown",
-            reply_markup=managed_chats_menu(),
-        )
+        await _show_managed_chats(query)
         return
 
     if data == "chats:add":
@@ -3704,10 +3720,27 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _owner_private_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ignore private traffic from everyone except configured owners.
+
+    Channel posts are intentionally not blocked here: the protection engine
+    must inspect those posts regardless of who published them. Private
+    commands, text prompts, and callback buttons are control traffic and are
+    therefore accepted only from an owner before any other handler runs.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    if user is None or chat is None or chat.type != "private":
+        return
+    if db.is_owner(user.id):
+        return
+    raise ApplicationHandlerStop
+
+
 async def _allowed_chat_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Restricts the bot to the managed chats list only.
-    Any chat (group, channel, supergroup) not in the list is ignored and the bot
-    leaves automatically.  The owner can add new chats at any time from the panel."""
+    Any chat (group, channel, supergroup) not in the list is ignored.
+    The bot stays in unmanaged chats so it can be added to them later."""
     chat = update.effective_chat
     if chat is None or chat.type == "private":
         return
@@ -3718,17 +3751,8 @@ async def _allowed_chat_gate(update: Update, context: ContextTypes.DEFAULT_TYPE)
             db.update_managed_chat_title(chat.id, chat.title)
         return
 
-    # Not managed — leave if we were just added
-    if update.my_chat_member and chat.type in ("group", "supergroup", "channel"):
-        try:
-            await context.bot.leave_chat(chat.id)
-            log.info(
-                "Left unmanaged chat %s (%s) — not in the managed-chats list.",
-                chat.id, chat.title,
-            )
-        except Exception:
-            pass
-
+    # Do not leave unmanaged chats. The owner can add one from the panel
+    # after the bot has been added there.
     raise ApplicationHandlerStop
 
 
@@ -3743,6 +3767,12 @@ async def _text_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_application() -> Application:
     application = Application.builder().token(config.bot_token).build()
+
+    # --- Ignore private messages/callbacks from non-owners before dispatch ---
+    # This prevents unsolicited private traffic from reaching commands,
+    # pending-input handlers, or the control panel.
+    application.add_handler(MessageHandler(filters.ALL, _owner_private_gate), group=-3)
+    application.add_handler(CallbackQueryHandler(_owner_private_gate), group=-3)
 
     # --- Restrict the bot to a single configured chat (must run first, group=-2) ---
     application.add_handler(MessageHandler(filters.ALL, _allowed_chat_gate), group=-2)
